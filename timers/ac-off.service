@@ -1,0 +1,9 @@
+[Unit]
+Description=Turn AC off
+
+[Service]
+Type=oneshot
+User=klima
+Group=klima
+WorkingDirectory=/home/klima
+ExecStart=/home/klima/ac-off

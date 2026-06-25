@@ -1,0 +1,9 @@
+[Unit]
+Description=Turn AC on
+
+[Service]
+Type=oneshot
+User=klima
+Group=klima
+WorkingDirectory=/home/klima
+ExecStart=/home/klima/ac-on

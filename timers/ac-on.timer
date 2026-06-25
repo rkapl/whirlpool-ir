@@ -1,0 +1,10 @@
+[Unit]
+Description=Turn AC on every Sunday at 8 PM
+
+[Timer]
+OnCalendar=Sun *-*-* 20:00:00
+Persistent=true
+Unit=ac-on.service
+
+[Install]
+WantedBy=timers.target

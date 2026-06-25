@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+
+# ChatGPT translation of https://api-docs.esphome.io/whirlpool_8cpp_source.html
+
+import argparse
+import array
+import fcntl
+import os
+import shlex
+import struct
+import sys
+import time
+from pathlib import Path
+from dataclasses import dataclass
+
+def _IOW(type_char, nr, size):
+    # _IOC(dir, type, nr, size): dir=_IOC_WRITE=1, NRSHIFT=0, TYPESHIFT=8,
+    # SIZESHIFT=16, DIRSHIFT=30
+    return (1 << 30) | (ord(type_char) << 8) | nr | (size << 16)
+
+# LIRC ioctl interface
+LIRC_MODE_PULSE = 0x00000002
+
+# __u32 payload => size 4 bytes
+LIRC_SET_SEND_MODE = _IOW("i", 0x11, 4)
+LIRC_SET_SEND_CARRIER = _IOW("i", 0x13, 4)
+LIRC_SET_SEND_DUTY_CYCLE = _IOW("i", 0x15, 4)
+
+# ESPHome Whirlpool timings, microseconds
+CARRIER = 38000
+HEADER_MARK = 9000
+HEADER_SPACE = 4494
+BIT_MARK = 572
+ONE_SPACE = 1659
+ZERO_SPACE = 553
+GAP = 7960
+
+STATE_LEN = 21
+
+MODE = {
+    "heat": 0,
+    "auto": 1,
+    "cool": 2,
+    "dry": 3,
+    "fan": 4,
+    "off": None,
+}
+
+FAN = {
+    "auto": 0,
+    "high": 1,
+    "med": 2,
+    "medium": 2,
+    "low": 3,
+}
+@dataclass
+class TempRange:
+    min: int
+    max: int = 32
+
+def build_state(temp_range: TempRange, mode="cool", temp=24, fan="auto", power_toggle=False, swing=False):
+    st = [0x00] * STATE_LEN
+
+    # Fixed bytes from ESPHome WhirlpoolClimate::transmit_state()
+    st[0] = 0x83
+    st[1] = 0x06
+    st[6] = 0x80
+    st[18] = 0x08  # MODEL_DG11J1_3A / DG11J191 note in pasted source
+
+    mode = mode.lower()
+    fan = fan.lower()
+
+    if power_toggle:
+        st[2] |= 0x04
+        st[15] = 0x01
+    elif mode != "off":
+        if mode == "auto":
+            st[3] = MODE["auto"]
+            st[15] = 0x17
+        else:
+            st[3] = MODE[mode]
+            st[15] = 0x06
+
+    # Temperature is upper nibble of byte 3, offset from TEMP_MIN
+    temp = max(temp_range.min, min(temp_range.max, int(round(temp))))
+    if mode != "off":
+        st[3] |= (temp - temp_range.min) << 4
+
+    # Fan speed is lower two bits of byte 2
+    st[2] |= FAN[fan] & 0x03
+
+    # Swing command/toggle
+    if swing:
+        st[2] |= 0x80
+        st[8] |= 0x40
+
+    # Checksums: XOR ranges exactly as in ESPHome
+    for i in range(2, 13):
+        st[13] ^= st[i]
+    for i in range(14, 20):
+        st[20] ^= st[i]
+
+    return st
+
+
+def state_to_pulses(st):
+    # Returns a flat list of durations in microseconds, alternating
+    # pulse/space and starting and ending with a pulse (odd length), as
+    # required by the LIRC LIRC_MODE_PULSE write interface.
+    pulses = [HEADER_MARK, HEADER_SPACE]
+
+    bytes_sent = 0
+    for byte in st:
+        # LSB-first bit order: bool bit = i & (1 << j)
+        for bit_index in range(8):
+            bit = byte & (1 << bit_index)
+            pulses.append(BIT_MARK)
+            pulses.append(ONE_SPACE if bit else ZERO_SPACE)
+
+        bytes_sent += 1
+        if bytes_sent in (6, 14):
+            pulses.append(BIT_MARK)
+            pulses.append(GAP)
+
+    # Footer
+    pulses.append(BIT_MARK)
+    return pulses
+
+
+def send_pulses(device, pulses):
+    # Write raw pulse/space durations to the LIRC device in pulse mode.
+    fd = os.open(device, os.O_RDWR)
+    try:
+        fcntl.ioctl(fd, LIRC_SET_SEND_MODE, struct.pack("I", LIRC_MODE_PULSE))
+        fcntl.ioctl(fd, LIRC_SET_SEND_CARRIER, struct.pack("I", CARRIER))
+        fcntl.ioctl(fd, LIRC_SET_SEND_DUTY_CYCLE, struct.pack("I", 50))
+        buf = array.array("I", pulses)
+        os.write(fd, buf.tobytes())
+    finally:
+        os.close(fd)
+
+
+def config_args():
+    # Read default arguments from $XDG_CONFIG_HOME/klima.args (falling back to
+    # ~/.config/klima.args). Tokens are shell-quoted; lines starting with '#'
+    # are comments. These come before the real argv so the command line wins.
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    path = Path(base) / "klima.args"
+    if not path.is_file():
+        return []
+    tokens = []
+    for line in path.read_text().splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        tokens.extend(shlex.split(line))
+    return tokens
+
+def main():
+    p = argparse.ArgumentParser(description="Send Whirlpool IR control command")
+    p.add_argument("--mode", choices=MODE.keys(), default="cool")
+    p.add_argument('--temp-min', type=int, default=18,
+        help="Temperature offset, check if you AC is setting correct temps and adjust if necesssary")
+    p.add_argument("--temp", type=int, default=24)
+    p.add_argument("--fan", choices=FAN.keys(), default="auto")
+    p.add_argument("--power-toggle", action="store_true")
+    p.add_argument("--swing", action="store_true")
+    p.add_argument("--device", default="/dev/lirc0")
+    p.add_argument("--repeat", type=int, default=1)
+    args = p.parse_args(config_args() + sys.argv[1:])
+
+    st = build_state(
+        temp_range=TempRange(args.temp_min),
+        mode=args.mode,
+        temp=args.temp,
+        fan=args.fan,
+        power_toggle=args.power_toggle,
+        swing=args.swing,
+    )
+    
+
+    pulses = state_to_pulses(st)
+
+    print("State bytes:")
+    print(" ".join(f"{b:02X}" for b in st))
+
+    for i in range(args.repeat):
+        if i != 0:
+            time.sleep(5)
+        send_pulses(args.device, pulses)
+        print(f"Sent {len(pulses)} pulses to {args.device}")
+
+
+if __name__ == "__main__":
+    main()

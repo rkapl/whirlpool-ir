@@ -1,0 +1,10 @@
+[Unit]
+Description=Turn AC off every Friday at 8 PM
+
+[Timer]
+OnCalendar=Fri *-*-* 20:00:00
+Persistent=true
+Unit=ac-off.service
+
+[Install]
+WantedBy=timers.target
